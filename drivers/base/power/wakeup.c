@@ -28,12 +28,16 @@ static bool enable_wlan_wake_ws = false;
 module_param(enable_wlan_wake_ws, bool, 0644);
 static bool enable_bluedroid_timer_ws = false;
 module_param(enable_bluedroid_timer_ws, bool, 0644);
+static bool enable_timerfd_ws = false;
+module_param(enable_timerfd_ws, bool, 0644);
 static bool enable_bluesleep_ws = false;
 module_param(enable_bluesleep_ws, bool, 0644);
 static bool enable_msm_hsic_ws = false;
 module_param(enable_msm_hsic_ws, bool, 0644);
 static bool enable_netlink_ws = false;
 module_param(enable_netlink_ws, bool, 0644);
+static bool enable_wlan_wd_wake_ws = false;
+module_param(enable_wlan_wd_wake_ws, bool, 0644);
 
 #include "power.h"
 
@@ -360,12 +364,12 @@ EXPORT_SYMBOL_GPL(device_set_wakeup_enable);
 #ifdef CONFIG_PM_AUTOSLEEP
 static void update_prevent_sleep_time(struct wakeup_source *ws, ktime_t now)
 {
-	ktime_t delta = ktime_sub(now, ws->start_prevent_time);
-	ws->prevent_sleep_time = ktime_add(ws->prevent_sleep_time, delta);
+        ktime_t delta = ktime_sub(now, ws->start_prevent_time);
+        ws->prevent_sleep_time = ktime_add(ws->prevent_sleep_time, delta);
 }
 #else
 static inline void update_prevent_sleep_time(struct wakeup_source *ws,
-					     ktime_t now) {}
+                                             ktime_t now) {}
 #endif
 
 /**
@@ -378,50 +382,89 @@ static inline void update_prevent_sleep_time(struct wakeup_source *ws,
  */
 static void wakeup_source_deactivate(struct wakeup_source *ws)
 {
-	unsigned int cnt, inpr, cec;
-	ktime_t duration;
-	ktime_t now;
+        unsigned int cnt, inpr, cec;
+        ktime_t duration;
+        ktime_t now;
 
-	ws->relax_count++;
-	/*
-	 * __pm_relax() may be called directly or from a timer function.
-	 * If it is called directly right after the timer function has been
-	 * started, but before the timer function calls __pm_relax(), it is
-	 * possible that __pm_stay_awake() will be called in the meantime and
-	 * will set ws->active.  Then, ws->active may be cleared immediately
-	 * by the __pm_relax() called from the timer function, but in such a
-	 * case ws->relax_count will be different from ws->active_count.
-	 */
-	if (ws->relax_count != ws->active_count) {
-		ws->relax_count--;
-		return;
+        ws->relax_count++;
+        /*
+         * __pm_relax() may be called directly or from a timer function.
+         * If it is called directly right after the timer function has been
+         * started, but before the timer function calls __pm_relax(), it is
+         * possible that __pm_stay_awake() will be called in the meantime and
+         * will set ws->active.  Then, ws->active may be cleared immediately
+         * by the __pm_relax() called from the timer function, but in such a
+         * case ws->relax_count will be different from ws->active_count.
+         */
+        if (ws->relax_count != ws->active_count) {
+                ws->relax_count--;
+                return;
+        }
+
+        ws->active = false;
+
+        now = ktime_get();
+        duration = ktime_sub(now, ws->last_time);
+        ws->total_time = ktime_add(ws->total_time, duration);
+        if (ktime_to_ns(duration) > ktime_to_ns(ws->max_time))
+                ws->max_time = duration;
+
+        ws->last_time = now;
+        del_timer(&ws->timer);
+        ws->timer_expires = 0;
+
+        if (ws->autosleep_enabled)
+                update_prevent_sleep_time(ws, now);
+
+        /*
+         * Increment the counter of registered wakeup events and decrement the
+         * couter of wakeup events in progress simultaneously.
+         */
+        cec = atomic_add_return(MAX_IN_PROGRESS, &combined_event_count);
+        trace_wakeup_source_deactivate(ws->name, cec);
+
+        split_counters(&cnt, &inpr);
+        if (!inpr && waitqueue_active(&wakeup_count_wait_queue))
+                wake_up(&wakeup_count_wait_queue);
+}
+
+static bool wakeup_source_blocker(struct wakeup_source *ws)
+{
+	unsigned int wslen = 0;
+
+	if (ws) {
+		wslen = strlen(ws->name);
+
+		if ((!enable_si_ws && !strncmp(ws->name, "sensor_ind", wslen)) ||
+			(!enable_wlan_rx_wake_ws &&
+				!strncmp(ws->name, "wlan_rx_wake", wslen)) ||
+			(!enable_wlan_ctrl_wake_ws &&
+				!strncmp(ws->name, "wlan_ctrl_wake", wslen)) ||
+			(!enable_wlan_wake_ws &&
+				!strncmp(ws->name, "wlan_wake", wslen)) ||
+			(!enable_bluedroid_timer_ws &&
+				!strncmp(ws->name, "bluedroid_timer", wslen)) ||
+			(!enable_timerfd_ws &&
+				!strncmp(ws->name, "[timerfd]", wslen)) ||
+			(!enable_bluesleep_ws &&
+				!strncmp(ws->name, "bluesleep", wslen)) ||
+			(!enable_msm_hsic_ws &&
+				!strncmp(ws->name, "msm_hsic_host")) ||
+			(!enable_netlink_ws &&
+				!strncmp(ws->name, "NETLINK", wslen)) ||
+			(!enable_wlan_wd_wake_ws &&
+				!strncmp(ws->name, "wlan_wd_wake", wslen))) {
+			if (ws->active) {
+				wakeup_source_deactivate(ws);
+				pr_info("forcefully deactivate wakeup source: %s\n",
+					ws->name);
+			}
+
+			return true;
+		}
 	}
 
-	ws->active = false;
-
-	now = ktime_get();
-	duration = ktime_sub(now, ws->last_time);
-	ws->total_time = ktime_add(ws->total_time, duration);
-	if (ktime_to_ns(duration) > ktime_to_ns(ws->max_time))
-		ws->max_time = duration;
-
-	ws->last_time = now;
-	del_timer(&ws->timer);
-	ws->timer_expires = 0;
-
-	if (ws->autosleep_enabled)
-		update_prevent_sleep_time(ws, now);
-
-	/*
-	 * Increment the counter of registered wakeup events and decrement the
-	 * couter of wakeup events in progress simultaneously.
-	 */
-	cec = atomic_add_return(MAX_IN_PROGRESS, &combined_event_count);
-	trace_wakeup_source_deactivate(ws->name, cec);
-
-	split_counters(&cnt, &inpr);
-	if (!inpr && waitqueue_active(&wakeup_count_wait_queue))
-		wake_up(&wakeup_count_wait_queue);
+	return false;
 }
 
 /*
@@ -464,29 +507,6 @@ static void wakeup_source_activate(struct wakeup_source *ws)
 {
 	unsigned int cec;
 
-	if (((!enable_si_ws && !strcmp(ws->name, "sensor_ind")) ||
-		(!enable_wlan_rx_wake_ws &&
-			!strcmp(ws->name, "wlan_rx_wake")) ||
-		(!enable_wlan_ctrl_wake_ws &&
-			!strcmp(ws->name, "wlan_ctrl_wake")) ||
-		(!enable_wlan_wake_ws &&
-			!strcmp(ws->name, "wlan_wake")) ||
-		(!enable_netlink_ws &&
-			!strcmp(ws->name, "NETLINK")) ||
-		(!enable_msm_hsic_ws &&
-			!strcmp(ws->name, "msm_hsic_host")) ||
-		(!enable_bluedroid_timer_ws &&
-			!strcmp(ws->name, "bluedroid_timer")) ||
-		(!enable_bluesleep_ws && !strcmp(ws->name, "bluesleep")))) {
-		/*
-		 * let's try and deactivate this wakeup source since the user
-		 * clearly doesn't want it. The user is responsible for any
-		 * adverse effects and has been warned about it
-		 */
-		wakeup_source_deactivate(ws);
-		return;
-	}
-
 	ws->active = true;
 	ws->active_count++;
 	ws->last_time = ktime_get();
@@ -505,13 +525,15 @@ static void wakeup_source_activate(struct wakeup_source *ws)
  */
 static void wakeup_source_report_event(struct wakeup_source *ws)
 {
-	ws->event_count++;
-	/* This is racy, but the counter is approximate anyway. */
-	if (events_check_enabled)
-		ws->wakeup_count++;
+	if (!wakeup_source_blocker(ws)) {
+		ws->event_count++;
+		/* This is racy, but the counter is approximate anyway. */
+		if (events_check_enabled)
+			ws->wakeup_count++;
 
-	if (!ws->active)
-		wakeup_source_activate(ws);
+		if (!ws->active)
+			wakeup_source_activate(ws);
+	}
 }
 
 /**
