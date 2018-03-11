@@ -449,7 +449,7 @@ static bool wakeup_source_blocker(struct wakeup_source *ws)
 			(!enable_bluesleep_ws &&
 				!strncmp(ws->name, "bluesleep", wslen)) ||
 			(!enable_msm_hsic_ws &&
-				!strncmp(ws->name, "msm_hsic_host")) ||
+				!strncmp(ws->name, "msm_hsic_host", wslen)) ||
 			(!enable_netlink_ws &&
 				!strncmp(ws->name, "NETLINK", wslen)) ||
 			(!enable_wlan_wd_wake_ws &&
